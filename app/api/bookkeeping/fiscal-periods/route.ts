@@ -101,19 +101,39 @@ export async function POST(request: Request) {
       }
 
       // Enforce: max one editable prior period (no skipping ahead) — forward only.
-      // Locked periods are write-blocked by enforce_period_lock and so don't
-      // represent skipping ahead; they're the normal state during bokslut work,
-      // which BFL 6 kap allows in parallel with löpande bokföring of the new year.
-      const { count: openCount } = await supabase
+      // A period is "effectively locked" if EITHER its own locked_at is set, OR
+      // company_settings.bookkeeping_locked_through covers its end date (the
+      // enforce_company_lock_date trigger blocks any entry on/before that date).
+      // BFL 6 kap allows löpande bokföring of the new year in parallel with
+      // bokslut work on the prior year, so locked-but-not-closed prior periods
+      // must not block creating the next räkenskapsår.
+      const { data: openPeriods } = await supabase
         .from('fiscal_periods')
-        .select('id', { count: 'exact', head: true })
+        .select('name, period_start, period_end')
         .eq('company_id', companyId)
         .eq('is_closed', false)
         .is('locked_at', null)
+        .order('period_start', { ascending: true })
 
-      if (openCount && openCount > 0) {
+      const { data: settings } = await supabase
+        .from('company_settings')
+        .select('bookkeeping_locked_through')
+        .eq('company_id', companyId)
+        .maybeSingle()
+
+      const lockThrough = settings?.bookkeeping_locked_through ?? null
+      const trulyOpen = (openPeriods ?? []).filter(
+        (p) => !(lockThrough && p.period_end <= lockThrough)
+      )
+
+      if (trulyOpen.length > 0) {
+        const names = trulyOpen
+          .map((p) => `${p.name} (${p.period_start} – ${p.period_end})`)
+          .join(', ')
         return NextResponse.json(
-          { error: 'Cannot create a new period while an unlocked period exists' },
+          {
+            error: `Cannot create a new period while an unlocked period exists. Lock the following first: ${names}`,
+          },
           { status: 409 }
         )
       }

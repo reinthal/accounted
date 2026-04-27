@@ -13,6 +13,7 @@ import { PageHeader } from '@/components/ui/page-header'
 import { useToast } from '@/components/ui/use-toast'
 import { formatCurrency, formatDate } from '@/lib/utils'
 import { cn } from '@/lib/utils'
+import { invoiceNumberDisplay } from '@/lib/invoices/display'
 import { Plus, Search, Receipt, Lock } from 'lucide-react'
 import { EmptyInvoices } from '@/components/ui/empty-state'
 import { useCompany } from '@/contexts/CompanyContext'
@@ -87,7 +88,7 @@ export default function InvoicesPage() {
 
   const filteredInvoices = invoices.filter((invoice) => {
     const matchesSearch =
-      invoice.invoice_number.toLowerCase().includes(searchTerm.toLowerCase()) ||
+      (invoice.invoice_number ?? '').toLowerCase().includes(searchTerm.toLowerCase()) ||
       (invoice.customer as { name: string })?.name?.toLowerCase().includes(searchTerm.toLowerCase())
 
     const isCreditNote = !!invoice.credited_invoice_id
@@ -282,7 +283,7 @@ export default function InvoicesPage() {
                   <CardContent className="py-4">
                     <div className="min-w-0">
                         <div className="flex items-start sm:items-center justify-between gap-2">
-                          <p className="font-medium truncate">{invoice.invoice_number}</p>
+                          <p className={cn('font-medium truncate', !invoice.invoice_number && 'italic text-muted-foreground')}>{invoiceNumberDisplay(invoice.invoice_number)}</p>
                           <p className={`font-medium tabular-nums shrink-0 ${isCreditNote ? 'text-destructive' : ''}`}>
                             {formatCurrency(Number(invoice.total), invoice.currency)}
                           </p>

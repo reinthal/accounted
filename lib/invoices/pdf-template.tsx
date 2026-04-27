@@ -214,6 +214,26 @@ const styles = StyleSheet.create({
   creditNoteTitle: {
     color: '#721c24',
   },
+  draftBanner: {
+    marginBottom: 16,
+    padding: 10,
+    backgroundColor: '#fff3cd',
+    borderWidth: 2,
+    borderColor: '#856404',
+    borderRadius: 4,
+  },
+  draftBannerTitle: {
+    fontSize: 14,
+    fontWeight: 'bold',
+    color: '#856404',
+    textAlign: 'center',
+    marginBottom: 2,
+  },
+  draftBannerText: {
+    fontSize: 9,
+    color: '#856404',
+    textAlign: 'center',
+  },
   footer: {
     position: 'absolute',
     bottom: 30,
@@ -305,13 +325,26 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
   return (
     <Document>
       <Page size="A4" style={styles.page}>
+        {/* Draft banner — visible warning when this PDF is rendered for an
+            invoice that has not yet been assigned a löpnummer. ML 17 kap 24§
+            requires a unique invoice number; without one the document is not
+            valid as fakturaunderlag and must not be sent to a customer. */}
+        {!invoice.invoice_number && (
+          <View style={styles.draftBanner}>
+            <Text style={styles.draftBannerTitle}>UTKAST – inte en giltig faktura</Text>
+            <Text style={styles.draftBannerText}>
+              Denna faktura saknar löpnummer och kan inte användas som fakturaunderlag enligt ML 17 kap 24§. Skicka fakturan via systemet för att tilldela ett nummer.
+            </Text>
+          </View>
+        )}
+
         {/* Header */}
         <View style={styles.header}>
           <View>
             <Text style={[styles.title, isCreditNote ? styles.creditNoteTitle : {}]}>
               {getDocumentTitle(invoice)}
             </Text>
-            <Text style={{ marginTop: 5, color: '#666' }}>{invoice.invoice_number}</Text>
+            <Text style={{ marginTop: 5, color: '#666' }}>{invoice.invoice_number ?? 'FÖRHANDSGRANSKNING'}</Text>
           </View>
           <View style={styles.companyInfo}>
             {company.logo_url && (
@@ -567,7 +600,7 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
             {(company.invoice_show_ocr ?? true) && (
               <View style={styles.paymentRow}>
                 <Text style={styles.paymentLabel}>OCR/Referens:</Text>
-                <Text style={[styles.paymentValue, { fontWeight: 'bold' }]}>{generateOcrReference(invoice.invoice_number)}</Text>
+                <Text style={[styles.paymentValue, { fontWeight: 'bold' }]}>{invoice.invoice_number ? generateOcrReference(invoice.invoice_number) : '—'}</Text>
               </View>
             )}
           </View>
