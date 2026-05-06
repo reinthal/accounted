@@ -14,6 +14,11 @@ ensureInitialized()
  *
  * Converts a proforma invoice to a real invoice.
  * Copies all data, generates a real invoice number, and marks the proforma as cancelled.
+ *
+ * Ordering note: ensureInvoiceNumber() is the LAST side effect. The F-series
+ * counter only advances after items are inserted and the proforma is marked
+ * cancelled — so a partial failure in any earlier step rolls back the orphan
+ * row without leaking a number.
  */
 export async function POST(
   request: Request,
@@ -33,7 +38,6 @@ export async function POST(
 
   const companyId = await requireCompanyId(supabase, user.id)
 
-  // Fetch proforma with items
   const { data: proforma, error: proformaError } = await supabase
     .from('invoices')
     .select('*, items:invoice_items(*)')
@@ -59,9 +63,6 @@ export async function POST(
     )
   }
 
-  // Create the real invoice with invoice_number=null; assign atomically below.
-  // generate_invoice_number now requires the target row to exist so it can lock
-  // it (FOR UPDATE) and persist the number in the same transaction.
   const { data: invoice, error: invoiceError } = await supabase
     .from('invoices')
     .insert({
@@ -97,21 +98,6 @@ export async function POST(
     return NextResponse.json({ error: invoiceError.message }, { status: 500 })
   }
 
-  // Now that the row exists, allocate the F-series number. Mutates invoice
-  // in place so the response includes the assigned number.
-  try {
-    await ensureInvoiceNumber(supabase, companyId, invoice as Invoice)
-  } catch (err) {
-    // Roll back the partially-created invoice so the company counter is the
-    // only side effect to clean up (manually in worst case).
-    await supabase.from('invoices').delete().eq('id', invoice.id)
-    return NextResponse.json(
-      { error: err instanceof Error ? err.message : 'Failed to assign invoice number' },
-      { status: 500 }
-    )
-  }
-
-  // Copy invoice items
   const items = (proforma.items || []).map((item: { sort_order: number; description: string; quantity: number; unit: string; unit_price: number; line_total: number }) => ({
     invoice_id: invoice.id,
     sort_order: item.sort_order,
@@ -133,13 +119,37 @@ export async function POST(
     }
   }
 
-  // Mark proforma as cancelled
-  await supabase
+  // Cancel the proforma. If this fails, the new (still unnumbered) invoice
+  // is an orphan — delete it so the user can retry without ending up with
+  // two active invoices for the same proforma. invoice_items cascade.
+  const previousProformaStatus = proforma.status
+  const { error: cancelError } = await supabase
     .from('invoices')
     .update({ status: 'cancelled' })
     .eq('id', id)
 
-  // Fetch complete invoice
+  if (cancelError) {
+    await supabase.from('invoices').delete().eq('id', invoice.id)
+    return NextResponse.json({ error: cancelError.message }, { status: 500 })
+  }
+
+  // Allocate the F-series number last. If allocation fails, restore the
+  // proforma's previous status and delete the orphan invoice. The F-counter
+  // is unaffected because generate_invoice_number only commits on success.
+  try {
+    await ensureInvoiceNumber(supabase, companyId, invoice as Invoice)
+  } catch (err) {
+    await supabase
+      .from('invoices')
+      .update({ status: previousProformaStatus })
+      .eq('id', id)
+    await supabase.from('invoices').delete().eq('id', invoice.id)
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : 'Failed to assign invoice number' },
+      { status: 500 }
+    )
+  }
+
   const { data: completeInvoice } = await supabase
     .from('invoices')
     .select('*, customer:customers(*), items:invoice_items(*)')

@@ -433,6 +433,12 @@ const INVOICE: Record<string, StructuredErrorEntry> = {
     message_sv: 'E-postleverantören kunde inte skicka meddelandet.',
     message_en: 'The email provider could not deliver the message.',
   },
+  INVOICE_SEND_PDF_RENDER_FAILED: {
+    httpStatus: 500,
+    message_sv:
+      'Fakturans PDF kunde inte skapas. Kontrollera fakturarader och kunduppgifter och försök igen.',
+    message_en: 'Failed to render invoice PDF before send; no invoice number was consumed.',
+  },
   INVOICE_SEND_PARTIAL: {
     httpStatus: 200,
     message_sv:
@@ -468,6 +474,25 @@ const INVOICE: Record<string, StructuredErrorEntry> = {
     httpStatus: 500,
     message_sv: 'Kunde inte bokföra betalningen.',
     message_en: 'Failed to create payment journal entry.',
+  },
+  INVOICE_DELETE_NOT_DRAFT: {
+    httpStatus: 400,
+    message_sv: 'Endast utkast kan tas bort. Bokförda fakturor måste krediteras istället.',
+    message_en: 'Only draft invoices can be deleted; non-drafts must be credited.',
+    remediation: {
+      description: 'Issue a credit note instead of deleting a posted invoice.',
+    },
+  },
+  INVOICE_DELETE_NUMBERED: {
+    httpStatus: 400,
+    message_sv:
+      'Det här utkastet har redan tilldelats ett löpnummer och kan inte tas bort. Försök skicka det igen — om sändningen lyckas behövs inget annat steg.',
+    message_en:
+      'Draft already has an invoice number assigned; refusing to delete to preserve the number sequence. Retry the send — assignment is idempotent.',
+    remediation: {
+      description:
+        'Retry sending the invoice; ensureInvoiceNumber is idempotent so no new number will be consumed. If sending is no longer desired, contact support to clean up the orphan number.',
+    },
   },
 }
 
