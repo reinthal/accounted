@@ -166,6 +166,66 @@ export const POST = withRouteContext(
       periodEnd,
     })
 
+    // ── Derive worked hours from per-day records (hourly employees) ────
+    // For timanställda the calendar entries in salary_worked_days are the
+    // authoritative source. Sum the period and pass to the calculator. If
+    // no rows exist (legacy run, or hourly employee added without using the
+    // calendar), fall back to the snapshot column on salary_run_employees.
+    let derivedHoursWorked: number | null = null
+    if (emp.salary_type === 'hourly') {
+      const { data: workedDays, error: workedError } = await supabase
+        .from('salary_worked_days')
+        .select('hours')
+        .eq('company_id', companyId)
+        .eq('employee_id', emp.id)
+        .gte('work_date', periodStart)
+        .lte('work_date', periodEnd)
+      if (workedError) {
+        return errorResponse(workedError, opLog, { requestId })
+      }
+      derivedHoursWorked = (workedDays ?? []).reduce(
+        (sum, d) => Math.round((sum + Number(d.hours)) * 100) / 100,
+        0,
+      )
+      opLog.info('Derived hours_worked from calendar', {
+        employeeId: emp.id,
+        periodStart,
+        periodEnd,
+        rowCount: workedDays?.length ?? 0,
+        derivedHoursWorked,
+      })
+
+      // Refresh the hourly_salary line item so the displayed Lönerader table
+      // matches what the engine actually calculated. Without this, the
+      // placeholder created at employee-add time keeps showing 0 kr even
+      // after the user fills the calendar.
+      if (derivedHoursWorked > 0 && (emp.hourly_rate || 0) > 0) {
+        const baseAmount = Math.round((emp.hourly_rate as number) * derivedHoursWorked * 100) / 100
+        // Delete any existing hourly_salary rows for this sre, then insert a
+        // single fresh one. Avoids the "did the row already exist?" branch.
+        await supabase
+          .from('salary_line_items')
+          .delete()
+          .eq('salary_run_employee_id', sre.id)
+          .eq('item_type', 'hourly_salary')
+        await supabase.from('salary_line_items').insert({
+          salary_run_employee_id: sre.id,
+          company_id: companyId,
+          item_type: 'hourly_salary',
+          description: 'Timlön',
+          quantity: derivedHoursWorked,
+          amount: baseAmount,
+          is_taxable: true,
+          is_avgift_basis: true,
+          is_vacation_basis: true,
+          is_gross_deduction: false,
+          is_net_deduction: false,
+          account_number: getLineItemAccount('hourly_salary'),
+          sort_order: 0,
+        })
+      }
+    }
+
     const employeeName = `${emp.first_name} ${emp.last_name}`
     if (absenceResult.flagLakarintyg) lakarintygEmployees.push(employeeName)
     if (absenceResult.flagFkReporting) fkReportingEmployees.push(employeeName)
@@ -235,7 +295,12 @@ export const POST = withRouteContext(
         salaryType: emp.salary_type,
         monthlySalary: emp.monthly_salary || 0,
         hourlyRate: emp.hourly_rate || undefined,
-        hoursWorked: sre.hours_worked || undefined,
+        // Calendar-derived hours win when at least one row exists in the
+        // period. The legacy snapshot column (sre.hours_worked) only kicks
+        // in for runs predating the calendar feature.
+        hoursWorked: derivedHoursWorked !== null && derivedHoursWorked > 0
+          ? derivedHoursWorked
+          : sre.hours_worked || undefined,
         employmentDegree: emp.employment_degree,
         taxTableNumber: emp.tax_table_number,
         taxColumn: emp.tax_column || 1,
@@ -277,9 +342,17 @@ export const POST = withRouteContext(
 
     // Update salary_run_employee with calculated results. If any individual
     // update fails we abort so run totals aren't written from partial data.
+    // For hourly employees with calendar rows, also mirror the derived total
+    // into hours_worked so downstream code (reports, storno via correct/route)
+    // sees a consistent snapshot.
+    const snapshotHoursWorked =
+      derivedHoursWorked !== null && derivedHoursWorked > 0
+        ? derivedHoursWorked
+        : sre.hours_worked
     const { error: empUpdateError } = await supabase
       .from('salary_run_employees')
       .update({
+        hours_worked: snapshotHoursWorked,
         gross_salary: result.grossSalary,
         gross_deductions: result.grossDeductions,
         benefit_values: result.benefitValues,
