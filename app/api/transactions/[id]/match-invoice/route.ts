@@ -1,8 +1,6 @@
 import { NextResponse } from 'next/server'
-import {
-  createInvoicePaymentJournalEntry,
-  createInvoiceCashEntry,
-} from '@/lib/bookkeeping/invoice-entries'
+import { createInvoiceCashEntry } from '@/lib/bookkeeping/invoice-entries'
+import { buildInvoicePaymentClearingLines } from '@/lib/bookkeeping/invoice-payment-lines'
 import { reverseEntry, createJournalEntry, findFiscalPeriod } from '@/lib/bookkeeping/engine'
 import { AccountsNotInChartError, isBookkeepingError } from '@/lib/bookkeeping/errors'
 import { getErrorMessage } from '@/lib/errors/get-error-message'
@@ -98,6 +96,31 @@ export const POST = withRouteContext(
       return errorResponseFromCode('MATCH_INVOICE_NOT_OPEN', txLog, {
         requestId,
         details: { currentStatus: invoice.status },
+      })
+    }
+
+    // Currency-integrity guard (BFL 5 kap 2§ + swedish-compliance PR #614
+    // round 9). invoices.paid_amount / remaining_amount are denominated in
+    // invoice.currency; invoice_payments rows carry currency = invoice.currency
+    // with amount in that currency. The accumulator below assumes
+    // `tx.amount` is already in invoice.currency. For a SEK bank tx paying
+    // a USD invoice the accumulator would silently treat 230 SEK as "230
+    // USD paid" and flip a 140 USD invoice to status=paid after a partial.
+    //
+    // Block cross-currency on this single-allocation path until a proper
+    // FX-aware settlement flow lands. Same-currency (SEK→SEK or USD→USD)
+    // remains fully supported including partials; the buildInvoicePayment-
+    // ClearingLines helper handles the bookkeeping side correctly in both
+    // cases. For SEK tx → USD invoice the user should use the multi-
+    // allocation dialog (gnubok_match_batch_allocate) which DOES handle
+    // FX-diff postings on 3960/7960 end-to-end.
+    if (transaction.currency !== invoice.currency) {
+      return errorResponseFromCode('MATCH_INVOICE_CURRENCY_MISMATCH', txLog, {
+        requestId,
+        details: {
+          transactionCurrency: transaction.currency,
+          invoiceCurrency: invoice.currency,
+        },
       })
     }
 
@@ -311,10 +334,48 @@ export const POST = withRouteContext(
         // intentional — under kontantmetoden 1510 has no prior balance, so
         // partials leave a credit on 1510 that gets resolved on final
         // payment when createInvoiceCashEntry would normally run.
-        const journalEntry = await createInvoicePaymentJournalEntry(
-          supabase, companyId, user.id, invoice as Invoice, transaction.date,
-          undefined, invoice.customer?.name, paidAmount,
+        //
+        // Builds lines via buildInvoicePaymentClearingLines so the verifikat
+        // is byte-identical to what the preview route showed the user. For
+        // same-currency invoices that's just 1930/1510. For cross-currency
+        // it also posts a 3960/7960 FX-diff line so the verifikat balances
+        // per BFL 5 kap 4–5§. Bypasses createInvoicePaymentJournalEntry on
+        // this single path (mark-paid and other callers still use it) —
+        // see lib/bookkeeping/invoice-payment-lines.ts for the contract.
+        const fiscalPeriodId = await findFiscalPeriod(supabase, companyId!, transaction.date)
+        if (!fiscalPeriodId) {
+          return errorResponseFromCode('INVOICE_PAID_NO_FISCAL_PERIOD', txLog, {
+            requestId,
+            details: { paymentDate: transaction.date },
+          })
+        }
+        const desc = invoice.customer?.name
+          ? `Inbetalning kundfaktura ${invoice.invoice_number}, ${invoice.customer.name}`
+          : `Inbetalning kundfaktura ${invoice.invoice_number}`
+        const { lines: clearingLines } = buildInvoicePaymentClearingLines(
+          {
+            amount: transaction.amount,
+            amount_sek: transaction.amount_sek ?? null,
+            currency: transaction.currency,
+            exchange_rate: transaction.exchange_rate ?? null,
+          },
+          {
+            currency: invoice.currency,
+            exchange_rate: invoice.exchange_rate ?? null,
+            remaining_amount: invoice.remaining_amount ?? null,
+            total: invoice.total,
+            paid_amount: invoice.paid_amount ?? null,
+          },
+          desc,
         )
+        const journalEntry = await createJournalEntry(supabase, companyId!, user.id, {
+          fiscal_period_id: fiscalPeriodId,
+          entry_date: transaction.date,
+          description: desc,
+          source_type: 'invoice_paid',
+          source_id: invoice.id,
+          lines: clearingLines,
+        })
         journalEntryId = journalEntry?.id ?? null
       }
     } catch (err) {

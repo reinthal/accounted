@@ -11,6 +11,7 @@ import type { SupabaseClient } from '@supabase/supabase-js'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
 import { upsertCounterpartyTemplate, findCounterpartyTemplatesBatch, formatCounterpartyName } from '@/lib/bookkeeping/counterparty-templates'
+import { formatVoucherLabel } from '@/lib/transactions/link-journal-entry'
 import { eventBus } from '@/lib/events/bus'
 import { getVatRules, getAvailableVatRates } from '@/lib/invoices/vat-rules'
 import { fetchExchangeRate, convertToSEK } from '@/lib/currency/riksbanken'
@@ -4404,6 +4405,533 @@ export const tools: McpTool[] = [
           description: 'After approval the transaction is linked and the invoice is marked paid. Use gnubok_get_ar_ledger to verify the customer balance.',
           tool: 'gnubok_get_ar_ledger',
         }
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_match_batch_allocate',
+    description: 'Allocate 1 bank tx across N customer OR N supplier invoices (samlingsbetalning, BFL 5 kap 6§). Use when one receipt covers many invoices, or one transfer pays many bills. Customer kind requires income tx; supplier kind requires expense. Never mix kinds. Stages.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        transaction_id: { type: 'string' },
+        allocations: {
+          type: 'array',
+          minItems: 1,
+          maxItems: 100,
+          items: {
+            type: 'object',
+            additionalProperties: false,
+            properties: {
+              kind: { type: 'string', enum: ['customer_invoice', 'supplier_invoice'] },
+              invoice_id: { type: 'string' },
+              supplier_invoice_id: { type: 'string' },
+              amount: { type: 'number', exclusiveMinimum: 0, description: 'Amount in TX currency. Cross-currency = bank-credited SEK.' },
+            },
+            required: ['kind', 'amount'],
+          },
+        },
+      },
+      required: ['transaction_id', 'allocations'],
+    },
+    outputSchema: STAGED_OPERATION_SCHEMA,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+    async execute(args, companyId, userId, supabase, actor) {
+      const transactionId = args.transaction_id as string
+      const allocations = args.allocations as Array<{
+        kind: 'customer_invoice' | 'supplier_invoice'
+        invoice_id?: string
+        supplier_invoice_id?: string
+        amount: number
+      }>
+      if (!transactionId) throw new Error('transaction_id is required')
+      if (!Array.isArray(allocations) || allocations.length === 0) {
+        throw new Error('allocations is required (non-empty array)')
+      }
+
+      const { data: transaction, error: txError } = await supabase
+        .from('transactions')
+        .select('id, description, merchant_name, amount, currency, date, journal_entry_id')
+        .eq('id', transactionId)
+        .eq('company_id', companyId)
+        .single()
+      if (txError || !transaction) throw new Error('Transaction not found')
+      if (transaction.journal_entry_id) throw new Error('Transaction is already booked')
+      if (transaction.amount === 0) throw new Error('Transaction has zero amount')
+
+      // Direction guard mirrors the RPC: customer_invoice → income, supplier_invoice → expense.
+      const hasCustomer = allocations.some((a) => a.kind === 'customer_invoice')
+      const hasSupplier = allocations.some((a) => a.kind === 'supplier_invoice')
+      if (hasCustomer && hasSupplier) {
+        throw new Error('Cannot mix customer_invoice and supplier_invoice allocations in one batch')
+      }
+      if (hasCustomer && transaction.amount <= 0) {
+        throw new Error('Customer allocations require an income transaction (amount > 0)')
+      }
+      if (hasSupplier && transaction.amount >= 0) {
+        throw new Error('Supplier allocations require an expense transaction (amount < 0)')
+      }
+
+      // Per-allocation guard (Greptile P1): each row must carry the
+      // correct ID for its kind. The inputSchema marks both invoice_id
+      // and supplier_invoice_id as optional because they're mutually
+      // exclusive — but the JSON-Schema vocabulary can't express "X
+      // required iff Y=A". Check explicitly here. Round-8: also reject
+      // unexpected extra IDs (V4.5) — a customer_invoice row supplying
+      // supplier_invoice_id silently leaks the extra ID into preview_data.
+      for (const [i, a] of allocations.entries()) {
+        if (a.kind === 'customer_invoice') {
+          if (!a.invoice_id) {
+            throw new Error(`allocations[${i}]: invoice_id is required when kind=customer_invoice`)
+          }
+          if (a.supplier_invoice_id) {
+            throw new Error(`allocations[${i}]: supplier_invoice_id must not be set when kind=customer_invoice`)
+          }
+        } else if (a.kind === 'supplier_invoice') {
+          if (!a.supplier_invoice_id) {
+            throw new Error(`allocations[${i}]: supplier_invoice_id is required when kind=supplier_invoice`)
+          }
+          if (a.invoice_id) {
+            throw new Error(`allocations[${i}]: invoice_id must not be set when kind=supplier_invoice`)
+          }
+        }
+      }
+
+      // Tenant-isolation pre-check (OWASP V8.2.1): verify every
+      // referenced invoice belongs to this company BEFORE staging.
+      // The RPC also re-checks this, but failing fast at the MCP
+      // layer gives the agent a clear error instead of an opaque
+      // BATCH_INVOICE_NOT_FOUND code at commit time.
+      const invoiceIds = allocations
+        .filter((a) => a.kind === 'customer_invoice')
+        .map((a) => a.invoice_id!)
+      const supplierInvoiceIds = allocations
+        .filter((a) => a.kind === 'supplier_invoice')
+        .map((a) => a.supplier_invoice_id!)
+      // Belt-and-suspenders (CC6.1): assert both count equality AND the
+      // missing-set is empty. The Supabase REST client de-dupes by PK so
+      // count >= unique input length is enough on its own, but the
+      // explicit guard prevents an undefined-row edge case in the JSON
+      // response from silently passing.
+      if (invoiceIds.length > 0) {
+        const uniqueIds = Array.from(new Set(invoiceIds))
+        const { data: found } = await supabase
+          .from('invoices')
+          .select('id')
+          .in('id', uniqueIds)
+          .eq('company_id', companyId)
+        const foundRows = found ?? []
+        const foundSet = new Set(foundRows.map((r) => r.id))
+        const missing = uniqueIds.filter((id) => !foundSet.has(id))
+        if (missing.length > 0 || foundRows.length !== uniqueIds.length) {
+          throw new Error(`Invoices not found for this company: ${missing.join(', ') || '(count mismatch)'}`)
+        }
+      }
+      if (supplierInvoiceIds.length > 0) {
+        const uniqueIds = Array.from(new Set(supplierInvoiceIds))
+        const { data: found } = await supabase
+          .from('supplier_invoices')
+          .select('id')
+          .in('id', uniqueIds)
+          .eq('company_id', companyId)
+        const foundRows = found ?? []
+        const foundSet = new Set(foundRows.map((r) => r.id))
+        const missing = uniqueIds.filter((id) => !foundSet.has(id))
+        if (missing.length > 0 || foundRows.length !== uniqueIds.length) {
+          throw new Error(`Supplier invoices not found for this company: ${missing.join(', ') || '(count mismatch)'}`)
+        }
+      }
+
+      const totalAllocated = allocations.reduce((sum, a) => sum + a.amount, 0)
+      const txAbs = Math.abs(transaction.amount)
+      // 0.005 SEK tolerance is for floating-point equalisation only,
+      // NOT a rounding allowance. The RPC `match_batch_allocate`
+      // re-enforces the same guard (BATCH_AMOUNT_EXCEEDS_TX /
+      // BATCH_AMOUNT_BELOW_TX) authoritatively (per PR #607 round 3),
+      // and the verifikat lines balance exactly to the öre.
+      if (Math.abs(totalAllocated - txAbs) > 0.005) {
+        throw new Error(
+          `Allocations sum (${totalAllocated.toFixed(2)}) must equal transaction amount (${txAbs.toFixed(2)})`
+        )
+      }
+
+      const txDesc = transaction.merchant_name || transaction.description || transactionId
+      // Swedish plurals: kundfaktura → kundfakturor (not kundfakturaor).
+      // Same for leverantörsfaktura → leverantörsfakturor.
+      const noun = hasCustomer ? 'kundfaktura' : 'leverantörsfaktura'
+      const summary = `${allocations.length} ${allocations.length === 1 ? noun : `${noun.slice(0, -1)}or`}`
+
+      return stagePendingOperation(supabase, companyId, userId, 'match_batch_allocate',
+        `Fördela: ${txDesc} → ${summary}`,
+        { transaction_id: transactionId, allocations },
+        // GDPR Art.25: transaction_description is included in preview_data
+        // so the user can recognise the tx at approval time (merchant_name
+        // or fallback to bank description). Same trade-off documented on
+        // gnubok_link_transaction_to_journal_entry — it's the minimum
+        // signal needed for an informed approval. Counterparty-identifying
+        // invoice IDs stay in params (audit trail); they are NOT echoed
+        // back into preview_data beyond aggregate counts.
+        {
+          transaction_description: txDesc,
+          transaction_amount: transaction.amount,
+          transaction_currency: transaction.currency,
+          transaction_date: transaction.date,
+          allocations_count: allocations.length,
+          allocations_kind: hasCustomer ? 'customer_invoice' : 'supplier_invoice',
+          total_allocated: totalAllocated,
+        },
+        actor,
+        {
+          description: 'After approval the combined verifikat is created and each invoice is advanced. Verify with gnubok_get_ar_ledger (customer) or gnubok_get_supplier_ledger.',
+          tool: hasCustomer ? 'gnubok_get_ar_ledger' : 'gnubok_get_supplier_ledger',
+        },
+        { dateForPeriodCheck: transaction.date }
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_link_transaction_to_journal_entry',
+    description: 'Link 1 bank tx to an already-posted verifikat (no new bokföring). Use when the user booked the affärshändelse manually. Pass invoice_id to also settle a kundfaktura. Stages.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        transaction_id: { type: 'string' },
+        journal_entry_id: { type: 'string' },
+        invoice_id: { type: 'string', description: 'Optional kundfaktura to settle alongside the link.' },
+      },
+      required: ['transaction_id', 'journal_entry_id'],
+    },
+    outputSchema: STAGED_OPERATION_SCHEMA,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+    async execute(args, companyId, userId, supabase, actor) {
+      const transactionId = args.transaction_id as string
+      const journalEntryId = args.journal_entry_id as string
+      const invoiceId = (args.invoice_id as string | undefined) ?? undefined
+      if (!transactionId || !journalEntryId) {
+        throw new Error('transaction_id and journal_entry_id are required')
+      }
+
+      // Tenant-isolation + state pre-checks (OWASP V8.2.1). The commit
+      // handler re-validates authoritatively; failing fast at stage time
+      // gives the agent a clean error before the user is asked to approve.
+      const { data: tx, error: txError } = await supabase
+        .from('transactions')
+        .select('id, date, amount, currency, journal_entry_id, description, merchant_name')
+        .eq('id', transactionId)
+        .eq('company_id', companyId)
+        .maybeSingle()
+      if (txError || !tx) throw new Error('Transaction not found')
+      if (tx.journal_entry_id) {
+        throw new Error('Transaction is already linked to a journal entry')
+      }
+
+      const { data: je, error: jeError } = await supabase
+        .from('journal_entries')
+        .select('id, status, voucher_series, voucher_number, entry_date')
+        .eq('id', journalEntryId)
+        .eq('company_id', companyId)
+        .maybeSingle()
+      if (jeError || !je) throw new Error('Journal entry not found')
+      if (je.status !== 'posted') {
+        throw new Error(`Journal entry must be posted (status=${je.status})`)
+      }
+
+      let invoicePreview: { invoice_number: string | null; remaining: number | null; will_be_fully_paid: boolean } | null = null
+      if (invoiceId) {
+        // GDPR Art.5(1)(c): only the columns the preview displays. We need
+        // remaining_amount for the will-be-fully-paid math, invoice_number
+        // for the staged-op title, and currency so we can fast-fail the
+        // mismatch before the user is asked to approve (the commit handler
+        // re-checks authoritatively via LINK_TX_INVOICE_CURRENCY_MISMATCH).
+        const { data: invoice, error: invError } = await supabase
+          .from('invoices')
+          .select('id, invoice_number, status, currency, remaining_amount')
+          .eq('id', invoiceId)
+          .eq('company_id', companyId)
+          .maybeSingle()
+        if (invError || !invoice) throw new Error('Invoice not found')
+        if (!['sent', 'overdue', 'partially_paid'].includes(invoice.status)) {
+          throw new Error(`Invoice is not in an open state (status=${invoice.status})`)
+        }
+        // Currency-mismatch pre-stage check (swedish-compliance PR #614
+        // round 8). The link-to-existing-voucher contract requires tx and
+        // invoice currency to match — cross-currency settlement must go
+        // through the match-invoice flow that posts 3960/7960 FX-diff
+        // lines via buildInvoicePaymentClearingLines. Failing fast here
+        // saves the user an approval round-trip.
+        if (tx.currency !== invoice.currency) {
+          throw new Error(
+            `Transaction currency (${tx.currency}) does not match invoice currency (${invoice.currency}). Cross-currency settlement must go through the match-invoice flow.`
+          )
+        }
+        // Explicit NaN guard (A.8.28): silently treating a malformed numeric
+        // column as 0 would let a bogus preview pass to the user. The DB
+        // column is NUMERIC NOT NULL on remaining_amount once status leaves
+        // 'draft', so a NaN here means something upstream is broken.
+        const remaining = Number(invoice.remaining_amount)
+        const txAmount = Number(tx.amount)
+        if (!Number.isFinite(remaining) || !Number.isFinite(txAmount)) {
+          throw new Error('Invoice remaining_amount or tx amount is not a finite number')
+        }
+        const newRemaining = Math.max(0, Math.round((remaining - txAmount) * 100) / 100)
+        invoicePreview = {
+          invoice_number: (invoice.invoice_number as string | null) ?? null,
+          remaining: newRemaining,
+          will_be_fully_paid: newRemaining <= 0,
+        }
+      }
+
+      // Period-lock check uses the LATER of tx.date and je.entry_date so a
+      // tx in an open period attached to a verifikat in a locked period
+      // surfaces the period_status envelope correctly. Mirrors the same
+      // logic in gnubok_bulk_book_transactions.
+      const txDate = tx.date as string
+      const jeDate = je.entry_date as string
+      const periodCheckDate = jeDate > txDate ? jeDate : txDate
+
+      // Centralised verifikat-label format (formatVoucherLabel) — keeps the
+      // MCP staging preview and the committed audit-trail label byte-identical,
+      // so BFL 5 kap 7§ traceability holds even if the format ever changes.
+      const voucherLabel = formatVoucherLabel(
+        je.voucher_series as string | null,
+        je.voucher_number as number | null,
+      )
+      const txDesc = (tx.merchant_name as string | null) || (tx.description as string | null) || transactionId.slice(0, 8)
+
+      return stagePendingOperation(
+        supabase,
+        companyId,
+        userId,
+        'link_transaction_journal_entry',
+        invoiceId
+          ? `Länka ${txDesc} → verifikat ${voucherLabel} + faktura ${invoicePreview?.invoice_number ?? invoiceId.slice(0, 8)}`
+          : `Länka ${txDesc} → verifikat ${voucherLabel}`,
+        { transaction_id: transactionId, journal_entry_id: journalEntryId, invoice_id: invoiceId ?? null },
+        // GDPR Art.25: voucher_description is intentionally OMITTED from
+        // preview_data — it can carry free-text merchant/counterparty PII
+        // and the voucher_label alone uniquely identifies the verifikat for
+        // the user's approval decision. Same reasoning as the per-tx
+        // description handling elsewhere in this file.
+        {
+          transaction_description: txDesc,
+          transaction_amount: tx.amount,
+          transaction_currency: tx.currency,
+          transaction_date: txDate,
+          voucher_label: voucherLabel,
+          voucher_date: jeDate,
+          invoice_id: invoiceId ?? null,
+          invoice_number: invoicePreview?.invoice_number ?? null,
+          invoice_remaining_after: invoicePreview?.remaining ?? null,
+          will_be_fully_paid: invoicePreview?.will_be_fully_paid ?? null,
+        },
+        actor,
+        {
+          description: invoiceId
+            ? 'After approval the tx attaches to the existing verifikat and the invoice flips to paid/partially_paid. No new bokföring. Verify with gnubok_get_ar_ledger.'
+            : 'After approval the tx attaches to the existing verifikat. No new bokföring. Verify with gnubok_query_journal.',
+          tool: invoiceId ? 'gnubok_get_ar_ledger' : 'gnubok_query_journal',
+        },
+        { dateForPeriodCheck: periodCheckDate }
+      )
+    },
+  },
+
+  {
+    name: 'gnubok_bulk_book_transactions',
+    description: 'Bulk-book N bank txs on the same date into 1 samlingsverifikat (BFL 5 kap 6§). Two paths: link N txs to an existing posted verifikat, or create a new verifikat from caller-supplied lines. All txs must share date + direction. Docs on the txs inherit. Stages.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        tx_ids: { type: 'array', minItems: 1, maxItems: 200, items: { type: 'string' } },
+        existing_journal_entry_id: { type: 'string' },
+        new_entry: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            description: { type: 'string', minLength: 1, maxLength: 500 },
+            lines: {
+              type: 'array',
+              minItems: 2,
+              maxItems: 200,
+              items: {
+                type: 'object',
+                additionalProperties: false,
+                properties: {
+                  account_number: { type: 'string', pattern: '^\\d{4}$' },
+                  debit_amount: { type: 'number', minimum: 0 },
+                  credit_amount: { type: 'number', minimum: 0 },
+                  currency: { type: 'string', minLength: 3, maxLength: 3 },
+                  line_description: { type: 'string', maxLength: 200 },
+                },
+                required: ['account_number', 'debit_amount', 'credit_amount', 'currency'],
+              },
+            },
+          },
+          required: ['description', 'lines'],
+        },
+      },
+      required: ['tx_ids'],
+    },
+    outputSchema: STAGED_OPERATION_SCHEMA,
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: false,
+      openWorldHint: false,
+    },
+    async execute(args, companyId, userId, supabase, actor) {
+      const txIds = args.tx_ids as string[]
+      const existingJeId = (args.existing_journal_entry_id as string | undefined) ?? null
+      const newEntry = (args.new_entry as { description: string; lines: unknown[] } | undefined) ?? null
+      if (!Array.isArray(txIds) || txIds.length === 0) throw new Error('tx_ids is required (non-empty)')
+      if ((existingJeId == null) === (newEntry == null)) {
+        throw new Error('Provide exactly one of existing_journal_entry_id or new_entry')
+      }
+
+      // Balance pre-check on the create-new path (compliance-swarm V2.3
+      // / swedish-compliance). The RPC also rejects with
+      // BULK_BOOK_UNBALANCED, but failing fast here lets the agent get
+      // a clear error before staging is even attempted.
+      // The 0.005 tolerance is for floating-point equalisation only,
+      // NOT a rounding allowance per BFL 5 kap 4–5§. The RPC enforces
+      // exact balance to the öre on insert.
+      if (newEntry) {
+        const lines = (newEntry as { lines?: Array<{ debit_amount?: number; credit_amount?: number }> }).lines
+        if (Array.isArray(lines) && lines.length > 0) {
+          // Reject NaN / non-finite values explicitly (A.8.28).
+          // `Number(x) || 0` silently treats NaN as 0; that would let
+          // a malformed amount pass the balance check by accident.
+          // Round-8 addition: reject debit=0 && credit=0 "ghost" lines
+          // (BFL 5 kap 6§ — every line must represent a real
+          // bokföringspost with a non-zero amount).
+          for (const [i, l] of lines.entries()) {
+            const d = Number(l.debit_amount)
+            const c = Number(l.credit_amount)
+            if (!Number.isFinite(d) || !Number.isFinite(c)) {
+              throw new Error(`new_entry.lines[${i}]: debit_amount and credit_amount must be finite numbers`)
+            }
+            if (d === 0 && c === 0) {
+              throw new Error(`new_entry.lines[${i}]: debit_amount and credit_amount cannot both be zero (BFL 5 kap 6§)`)
+            }
+          }
+          const totalDebit = lines.reduce((s, l) => s + Number(l.debit_amount), 0)
+          const totalCredit = lines.reduce((s, l) => s + Number(l.credit_amount), 0)
+          if (Math.abs(totalDebit - totalCredit) > 0.005) {
+            throw new Error(
+              `new_entry.lines must balance — debits=${totalDebit.toFixed(2)} credits=${totalCredit.toFixed(2)}`
+            )
+          }
+        }
+      }
+
+      const { data: txs, error: txError } = await supabase
+        .from('transactions')
+        .select('id, amount, currency, date, journal_entry_id')
+        .in('id', txIds)
+        .eq('company_id', companyId)
+      if (txError || !txs || txs.length !== txIds.length) {
+        throw new Error('One or more transactions not found')
+      }
+      const booked = txs.find((t) => t.journal_entry_id != null)
+      if (booked) throw new Error(`Transaction ${booked.id} is already booked`)
+      const dates = new Set(txs.map((t) => t.date))
+      if (dates.size > 1) throw new Error('All transactions must share the same date')
+      // Reject zero-amount txs (round-8 / A.8.28). The direction computation
+      // below treats amount === 0 as 'expense' (amount > 0 is false), which
+      // would then mis-classify a real income tx in the same batch. Mirrors
+      // the explicit zero-amount guard in gnubok_match_batch_allocate.
+      const zeroAmountTx = txs.find((t) => t.amount === 0)
+      if (zeroAmountTx) throw new Error(`Transaction ${zeroAmountTx.id} has zero amount`)
+      const direction = txs[0]!.amount > 0 ? 'income' : 'expense'
+      if (txs.some((t) => (direction === 'income' ? t.amount < 0 : t.amount > 0))) {
+        throw new Error('All transactions must share the same direction (all income or all expense)')
+      }
+      // Currency homogeneity (swedish-compliance): a samlingsverifikat
+      // combining e.g. SEK + EUR txs without explicit FX lines violates
+      // BFL 5 kap 2§ (alla belopp skall uttryckas i svenska kronor)
+      // read together with the valutakurs rules in BFL 5 kap 6§.
+      // Cross-currency batches should go through gnubok_match_batch_allocate
+      // (which handles the FX diff on 7960/3960). Reject mixed currencies here.
+      const currencies = new Set(txs.map((t) => t.currency))
+      if (currencies.size > 1) {
+        // Route the agent to the cross-currency-capable tool rather
+        // than letting it retry with hand-built FX lines.
+        throw new Error(
+          'All transactions must share the same currency. For cross-currency allocations, use gnubok_match_batch_allocate (which handles the FX diff on 7960/3960).'
+        )
+      }
+
+      const txSum = txs.reduce((s, t) => s + t.amount, 0)
+      const txDate = txs[0]!.date as string
+
+      // For link-existing branch, also fetch the target JE and use the
+      // LATER of tx_date and JE.entry_date for period-lock check
+      // (swedish-compliance): otherwise a tx in an open period could be
+      // attached to a verifikat in a closed period and the guard
+      // would miss it. Same query also enforces tenant isolation on
+      // the JE (OWASP V8.2.1) before the RPC sees the ID.
+      let periodCheckDate = txDate
+      if (existingJeId) {
+        const { data: je, error: jeError } = await supabase
+          .from('journal_entries')
+          .select('id, entry_date, status')
+          .eq('id', existingJeId)
+          .eq('company_id', companyId)
+          .maybeSingle()
+        if (jeError || !je) {
+          throw new Error('Existing journal entry not found for this company')
+        }
+        if (je.status !== 'posted') {
+          throw new Error(`Existing journal entry must be posted (status=${je.status})`)
+        }
+        // Pass the later date so the period-lock guard fires on whichever
+        // side is in a locked/closed period.
+        periodCheckDate = (je.entry_date as string) > txDate ? (je.entry_date as string) : txDate
+      }
+
+      return stagePendingOperation(supabase, companyId, userId, 'bulk_book_transactions',
+        existingJeId
+          ? `Länka ${txIds.length} transaktioner till verifikat (${txDate})`
+          : `Samlingsverifikation: ${txIds.length} transaktioner ${txDate}`,
+        {
+          tx_ids: txIds,
+          existing_journal_entry_id: existingJeId,
+          new_entry: newEntry,
+        },
+        // GDPR Art.25: preview_data carries only aggregate counts + the
+        // shared date/direction — no per-tx descriptions, no per-line
+        // descriptions, no counterparty IDs. The user-facing approval
+        // dialog reconstructs detail from the tx_ids list at render time
+        // rather than persisting denormalized PII here. Same privacy-by-
+        // design rationale as gnubok_link_transaction_to_journal_entry.
+        {
+          tx_count: txIds.length,
+          tx_date: txDate,
+          tx_sum: txSum,
+          direction,
+          mode: existingJeId ? 'link_existing' : 'create_new',
+        },
+        actor,
+        {
+          description: 'After approval the verifikat carries the combined business event. Verify with gnubok_query_journal or gnubok_get_reconciliation_status.',
+          tool: 'gnubok_query_journal',
+        },
+        { dateForPeriodCheck: periodCheckDate }
       )
     },
   },

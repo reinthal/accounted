@@ -346,6 +346,13 @@ const MATCH_INVOICE: Record<string, StructuredErrorEntry> = {
     message_sv: 'Endast fakturor kan matchas mot en transaktion. Proforma och följesedel saknar momsskyldighet.',
     message_en: 'Only invoices may be matched to a transaction; proforma and delivery notes have no VAT obligation.',
   },
+  MATCH_INVOICE_CURRENCY_MISMATCH: {
+    httpStatus: 400,
+    message_sv:
+      'Transaktionens och fakturans valuta måste vara samma. För valutaomräkning, använd flerfaktura-matchningen som hanterar valutakursdifferenser på 3960/7960.',
+    message_en:
+      'Transaction and invoice currency must match. For cross-currency settlement, use the multi-invoice allocation flow which posts FX-diff lines on 3960/7960.',
+  },
   MATCH_INVOICE_ALREADY_PAID: {
     httpStatus: 409,
     message_sv: 'Fakturan har redan slutbetalats av en annan förfrågan.',
@@ -433,6 +440,13 @@ const LINK_TX_JE: Record<string, StructuredErrorEntry> = {
     httpStatus: 409,
     message_sv: 'Fakturan ändrades samtidigt. Försök igen.',
     message_en: 'Invoice status changed concurrently. Retry the request.',
+  },
+  LINK_TX_INVOICE_CURRENCY_MISMATCH: {
+    httpStatus: 400,
+    message_sv:
+      'Transaktionens och fakturans valuta måste vara samma för att länka till en befintlig verifikation. Använd matchningsdialogen för valutaomräkning.',
+    message_en:
+      'Transaction and invoice currency must match to link to an existing voucher. Use the match-invoice flow for cross-currency settlement.',
   },
 }
 

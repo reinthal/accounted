@@ -40,6 +40,7 @@ import {
   createSupplierInvoiceRegistrationEntry,
 } from '@/lib/bookkeeping/supplier-invoice-entries'
 import { linkInvoiceToVoucher } from '@/lib/invoices/voucher-matching'
+import { linkTransactionToJournalEntry } from '@/lib/transactions/link-journal-entry'
 import { getErrorEntry } from '@/lib/errors/structured-errors'
 import { parseSIEFile } from '@/lib/import/sie-parser'
 import { executeSIEImport, undoSIEImport } from '@/lib/import/sie-import'
@@ -2615,6 +2616,197 @@ async function commitGenerateAgi(
   }
 }
 
+// ── Multi-tx commit handlers (PRs #603/#606/#608/#610) ────────────
+//
+// Both wrap their SQL RPC. The RPCs do all the heavy lifting (locking,
+// balance/period checks, journal entry creation, voucher number,
+// payment/junction rows, doc inheritance). The commit handlers just
+// shape params, call the RPC, and translate the structured error code
+// or success payload into an ExecutorResult.
+
+async function commitMatchBatchAllocate(
+  supabase: SupabaseClient,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  // Trust boundary (compliance-swarm V8.2.1, A.8.2):
+  // Tenant isolation is enforced authoritatively inside the SQL RPC
+  // `match_batch_allocate` (supabase/migrations/20260601122000_*.sql):
+  //   - `transactions` row fetched WHERE id = p_tx_id AND company_id = p_company_id
+  //   - `invoices` and `supplier_invoices` rows fetched WHERE id = ? AND company_id = p_company_id
+  //   - `auth.uid()` resolves the caller; membership checked against
+  //     `company_members.company_id = p_company_id`
+  // The MCP execute() handler additionally pre-checks the same IDs to
+  // surface clean errors before staging. This commit handler is a thin
+  // pass-through by design — re-querying here would triple the same
+  // check without adding security.
+  const txId = params.transaction_id as string
+  const allocations = params.allocations
+  if (!txId) return { error: 'transaction_id is required', status: 400 }
+  if (!Array.isArray(allocations) || allocations.length === 0) {
+    return { error: 'allocations is required (non-empty array)', status: 400 }
+  }
+  const { data, error } = await supabase.rpc('match_batch_allocate', {
+    p_tx_id: txId,
+    p_allocations: allocations,
+    p_company_id: companyId,
+  })
+  if (error) {
+    // Sanitised log (A.8.11, CC7.2): only error code + message, no
+    // payload — error.details can echo invoice IDs, amounts, etc.
+    log.error('match_batch_allocate RPC error', {
+      code: (error as { code?: string }).code,
+      message: error.message,
+    })
+    return { error: error.message || 'Database error', status: 500 }
+  }
+  const result = data as { ok: boolean; code?: string; details?: unknown; journal_entry_id?: string }
+  if (!result || !result.ok) {
+    return {
+      error: result?.code || 'match_batch_allocate failed',
+      status: 400,
+      data: result?.details as Record<string, unknown> | undefined,
+    }
+  }
+  // Structured audit-trail entry on success (compliance-swarm V16). Tx
+  // count + JE id + the source tx id only — no amounts, no
+  // counterparty identifiers, no descriptions. txId is included
+  // intentionally so the audit trail can join successful commits back
+  // to the source bank tx without a separate query; it's not PII on
+  // its own (just an internal UUID, scoped to companyId already logged).
+  log.info('match_batch_allocate committed', {
+    companyId,
+    operationType: 'match_batch_allocate',
+    journalEntryId: result.journal_entry_id,
+    txId,
+    allocationCount: allocations.length,
+  })
+  return { data: result as unknown as Record<string, unknown>, status: 200 }
+}
+
+async function commitBulkBookTransactions(
+  supabase: SupabaseClient,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  // Trust boundary (compliance-swarm V8.2.1, A.8.2):
+  // Tenant isolation + chart-of-accounts validation are enforced
+  // authoritatively inside the SQL RPC `bulk_book_transactions`
+  // (supabase/migrations/20260602121000_*.sql):
+  //   - All `transactions` rows fetched WHERE id = ANY(p_tx_ids) AND
+  //     company_id = p_company_id (line ~115).
+  //   - `journal_entries` row (link-existing branch) fetched WHERE id =
+  //     p_existing_journal_entry_id AND company_id = p_company_id.
+  //   - Every account_number in p_new_entry.lines validated against
+  //     `chart_of_accounts` filtered by company_id + is_active (PR #610
+  //     round 2 added this allowlist).
+  //   - `auth.uid()` resolves the caller; membership checked against
+  //     `company_members.company_id = p_company_id`.
+  // The MCP execute() handler additionally pre-checks tx ownership +
+  // JE ownership at stage time to surface clean errors. This commit
+  // handler is a thin pass-through by design.
+  const txIds = params.tx_ids
+  const existingJeId = (params.existing_journal_entry_id as string | null | undefined) ?? null
+  const newEntry = (params.new_entry as Record<string, unknown> | null | undefined) ?? null
+  if (!Array.isArray(txIds) || txIds.length === 0) {
+    return { error: 'tx_ids is required (non-empty array)', status: 400 }
+  }
+  if ((existingJeId == null) === (newEntry == null)) {
+    return {
+      error: 'Provide exactly one of existing_journal_entry_id or new_entry',
+      status: 400,
+    }
+  }
+  const { data, error } = await supabase.rpc('bulk_book_transactions', {
+    p_tx_ids: txIds,
+    p_existing_journal_entry_id: existingJeId,
+    p_new_entry: newEntry,
+    p_company_id: companyId,
+  })
+  if (error) {
+    // Sanitised log (A.8.11, CC7.2): only error code + message.
+    log.error('bulk_book_transactions RPC error', {
+      code: (error as { code?: string }).code,
+      message: error.message,
+    })
+    return { error: error.message || 'Database error', status: 500 }
+  }
+  const result = data as { ok: boolean; code?: string; details?: unknown; journal_entry_id?: string; mode?: string; linked_tx_count?: number; docs_linked?: number }
+  if (!result || !result.ok) {
+    return {
+      error: result?.code || 'bulk_book_transactions failed',
+      status: 400,
+      data: result?.details as Record<string, unknown> | undefined,
+    }
+  }
+  // Structured audit-trail entry on success (compliance-swarm V16).
+  log.info('bulk_book_transactions committed', {
+    companyId,
+    operationType: 'bulk_book_transactions',
+    journalEntryId: result.journal_entry_id,
+    mode: result.mode,
+    txCount: result.linked_tx_count,
+    docsLinked: result.docs_linked,
+  })
+  return { data: result as unknown as Record<string, unknown>, status: 200 }
+}
+
+async function commitLinkTransactionJournalEntry(
+  supabase: SupabaseClient,
+  userId: string,
+  companyId: string,
+  params: Record<string, unknown>
+): Promise<ExecutorResult> {
+  const transactionId = params.transaction_id as string | undefined
+  const journalEntryId = params.journal_entry_id as string | undefined
+  const invoiceId = (params.invoice_id as string | undefined) ?? undefined
+
+  if (!transactionId || !journalEntryId) {
+    return { error: 'transaction_id and journal_entry_id are required', status: 400 }
+  }
+
+  const outcome = await linkTransactionToJournalEntry(supabase, userId, companyId, {
+    transactionId,
+    journalEntryId,
+    invoiceId,
+  })
+
+  if (!outcome.ok) {
+    const entry = getErrorEntry(outcome.code)
+    const httpStatus = entry?.httpStatus ?? 500
+    return {
+      error: entry?.message_en ?? outcome.code,
+      status: httpStatus,
+      data: outcome.details as Record<string, unknown> | undefined,
+    }
+  }
+
+  // Structured audit-trail entry on success (compliance-swarm V16, SOC 2 CC4.1).
+  // Mirrors commitMatchBatchAllocate / commitBulkBookTransactions — IDs only,
+  // no amounts or counterparty PII. invoiceId is logged as boolean to avoid
+  // leaking which invoices are touched while still distinguishing the two
+  // code paths (link-only vs link+settle).
+  log.info('link_transaction_journal_entry committed', {
+    companyId,
+    operationType: 'link_transaction_journal_entry',
+    transactionId: outcome.result.transactionId,
+    journalEntryId: outcome.result.journalEntryId,
+    settledInvoice: outcome.result.invoiceId != null,
+  })
+
+  return {
+    data: {
+      transaction_id: outcome.result.transactionId,
+      journal_entry_id: outcome.result.journalEntryId,
+      voucher_label: outcome.result.voucherLabel,
+      invoice_id: outcome.result.invoiceId,
+      invoice_status: outcome.result.invoiceStatus,
+      paid_amount: outcome.result.paidAmount,
+      remaining_amount: outcome.result.remainingAmount,
+    },
+  }
+}
+
 // ── Public dispatcher ────────────────────────────────────────────
 
 /**
@@ -2755,6 +2947,15 @@ export async function commitPendingOperation(
         break
       case 'generate_agi':
         result = await commitGenerateAgi(supabase, userId, companyId, pendingOp.params)
+        break
+      case 'match_batch_allocate':
+        result = await commitMatchBatchAllocate(supabase, companyId, pendingOp.params)
+        break
+      case 'bulk_book_transactions':
+        result = await commitBulkBookTransactions(supabase, companyId, pendingOp.params)
+        break
+      case 'link_transaction_journal_entry':
+        result = await commitLinkTransactionJournalEntry(supabase, userId, companyId, pendingOp.params)
         break
       default:
         return {
