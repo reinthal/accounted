@@ -792,7 +792,6 @@ export async function POST(request: Request) {
         company_id: companyId,
         status: 'received',
         source: 'upload',
-        document_type: 'supplier_invoice',
         matched_supplier_id: supplierMap['Demokafé AB'],
         extracted_data: {
           supplier: { name: 'Demokafé AB' },

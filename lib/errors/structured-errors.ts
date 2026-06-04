@@ -534,9 +534,9 @@ const MATCH_SI: Record<string, StructuredErrorEntry> = {
   MATCH_SI_CASH_FX_UNSUPPORTED: {
     httpStatus: 400,
     message_sv:
-      'Kontantmetoden stödjer inte valutakursdifferenser. Byt till löpande bokföring eller bokför valutakursdifferensen manuellt.',
+      'Kontantmetoden kan inte dela upp en delbetalning i utländsk valuta. Betala hela fakturan på en gång, byt till löpande bokföring eller bokför betalningen manuellt.',
     message_en:
-      'Cash accounting does not support exchange-rate differences. Switch to accrual or book the FX difference manually.',
+      'The cash method cannot handle a partial foreign-currency payment. Pay the invoice in full, switch to accrual, or book the payment manually.',
   },
   MATCH_SI_AMOUNT_EXCEEDS_REMAINING: {
     httpStatus: 400,
@@ -1275,6 +1275,13 @@ const PROVIDER_MIGRATION: Record<string, StructuredErrorEntry> = {
     httpStatus: 400,
     message_sv: 'SIE-export stöds för närvarande endast för Fortnox.',
     message_en: 'SIE export is currently only supported for Fortnox.',
+  },
+  PROVIDER_SIE_IMPORT_REQUIRED: {
+    httpStatus: 409,
+    message_sv:
+      'Bokföringsdata (SIE) måste importeras först. Ladda upp en SIE-fil med kontoplan, ingående balanser och verifikationer innan du hämtar kunder, leverantörer och fakturor från den här leverantören.',
+    message_en:
+      'A completed SIE import is required first. Import the SIE file (chart of accounts, opening balances and verifications) before importing customers, suppliers and invoices from this provider.',
   },
   PROVIDER_MIGRATE_FAILED: {
     httpStatus: 500,
