@@ -504,7 +504,12 @@ export async function POST(request: Request) {
           company_id: companyId,
           date: toDateStr(fiveDaysAgo),
           description: 'SJ BILJETT',
-          amount: -2500,
+          // > 4 000 kr categorized business expense with no attached underlag,
+          // so gnubok_vat_close_check surfaces a non-empty blocker list.
+          // (BFL 5 kap 6–7§ require every affärshändelse to be documented with
+          // underlag; the 4 000 kr cut-off is the tool's own high-value
+          // heuristic, not a statutory threshold.)
+          amount: -4500,
           category: 'expense_travel',
           is_business: true,
           merchant_name: 'SJ',
