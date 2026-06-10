@@ -168,6 +168,8 @@ export type CoreEvent =
       userId: string
       companyId: string
       sessionId: string | null                      // from Mcp-Session-Id header; null if absent
+      client: string | null                         // distribution-channel marker (X-Gnubok-Client header / ?client= param, e.g. 'openclaw').
+                                                    // Client-supplied (allow-list-sanitized) — telemetry only, never identity or authz.
     }}
   // tools/list — informs us whether agents are using progressive discovery
   // (gnubok_search_tools) or pulling the full list. Tool counts vary with
@@ -182,6 +184,7 @@ export type CoreEvent =
       userId: string
       companyId: string
       sessionId: string | null                      // from Mcp-Session-Id header; null if absent
+      client: string | null                         // distribution-channel marker; null if absent
     }}
   // resources/read — informs us which skills/widgets/data resources actually
   // get loaded by agents. `kind` discriminates by URI scheme so we can
@@ -199,6 +202,7 @@ export type CoreEvent =
       userId: string
       companyId: string
       sessionId: string | null                      // from Mcp-Session-Id header; null if absent
+      client: string | null                         // distribution-channel marker; null if absent
     }}
   // Workflow lifecycle — agents declare "I'm starting month-end-close" via
   // gnubok_load_skill (or implicitly by following a skill's recommended tool

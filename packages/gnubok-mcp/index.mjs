@@ -20,6 +20,15 @@
 
 const API_KEY = process.env.GNUBOK_API_KEY
 const MCP_URL = process.env.GNUBOK_URL || 'https://app.gnubok.se/api/extensions/ext/mcp-server/mcp'
+// Optional distribution-channel marker (e.g. 'openclaw'). Forwarded as
+// X-Gnubok-Client and recorded in server telemetry only — never affects auth.
+// Mirrors the server's allow-list so an invalid value degrades to "no header"
+// instead of fetch() rejecting every request with an invalid-header error.
+const rawClient = process.env.GNUBOK_CLIENT
+const CLIENT = rawClient && /^[A-Za-z0-9._-]{1,64}$/.test(rawClient) ? rawClient : undefined
+if (rawClient && !CLIENT) {
+  process.stderr.write('gnubok-mcp: ignoring GNUBOK_CLIENT — must match [A-Za-z0-9._-]{1,64}\n')
+}
 
 if (!API_KEY) {
   process.stderr.write(
@@ -82,6 +91,7 @@ async function handleMessage(line) {
       headers: {
         'Content-Type': 'application/json',
         'Authorization': `Bearer ${API_KEY}`,
+        ...(CLIENT ? { 'X-Gnubok-Client': CLIENT } : {}),
       },
       body: line,
     })
