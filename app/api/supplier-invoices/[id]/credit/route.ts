@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { eventBus } from '@/lib/events'
 import { ensureInitialized } from '@/lib/init'
 import { createSupplierCreditNoteEntry } from '@/lib/bookkeeping/supplier-invoice-entries'
+import { cancelSchedulesForSource } from '@/lib/bookkeeping/accruals/service'
 import { isBookkeepingError } from '@/lib/bookkeeping/errors'
 import { withRouteContext } from '@/lib/api/with-route-context'
 import { errorResponse, errorResponseFromCode } from '@/lib/errors/get-structured-error'
@@ -102,10 +103,14 @@ export const POST = withRouteContext(
     let journalEntryId: string | null = null
     if (accountingMethod === 'accrual') {
       try {
+        // Pass the ORIGINAL items: deferred lines carry their periodisering
+        // fields there, so the credit entry reverses against the same 17xx
+        // interim account the registration booked to. The copied credit-note
+        // items intentionally have no accrual fields.
         const journalEntry = await createSupplierCreditNoteEntry(
           supabase, companyId!, user.id,
           creditNote as SupplierInvoice,
-          creditItems as SupplierInvoiceItem[],
+          (original.items || []) as SupplierInvoiceItem[],
           original.supplier?.supplier_type || 'swedish_business',
           original.supplier?.name,
         )
@@ -133,6 +138,41 @@ export const POST = withRouteContext(
           },
         })
       }
+    }
+
+    // Periodisering interplay: cancel remaining months and storno the
+    // already-posted dissolutions so origin + dissolutions + stornos +
+    // credit-note net to zero on both the interim and cost accounts.
+    // Best-effort: a reversal hiccup (e.g. locked period) must not block the
+    // credit itself — the schedule stays active and visible for follow-up,
+    // and the response carries a PARTIAL-style warning (same pattern as the
+    // supplier-create route's ACCRUAL_SCHEDULE_FAILED warning).
+    const warnings: Array<{ code: string; message: string }> = []
+    try {
+      const cancelResult = await cancelSchedulesForSource(
+        supabase,
+        companyId!,
+        user.id,
+        { supplierInvoiceId: id },
+        { reversalDate: creditNote.invoice_date },
+      )
+      if (cancelResult.failedReversals > 0) {
+        warnings.push({
+          code: 'ACCRUAL_CANCEL_PARTIAL',
+          message:
+            'Fakturan krediterades, men en eller flera periodiseringsverifikat ' +
+            'kunde inte vändas. Periodiseringen är fortfarande aktiv — ' +
+            'kontrollera under Bokföring → Periodiseringar.',
+        })
+      }
+    } catch (err) {
+      opLog.warn('failed to cancel accrual schedules for credited supplier invoice', err as Error)
+      warnings.push({
+        code: 'ACCRUAL_CANCEL_PARTIAL',
+        message:
+          'Fakturan krediterades, men periodiseringarna kunde inte avslutas. ' +
+          'Kontrollera under Bokföring → Periodiseringar.',
+      })
     }
 
     const newRemaining = Math.max(0, original.remaining_amount - original.total)
@@ -163,6 +203,7 @@ export const POST = withRouteContext(
     return NextResponse.json({
       data: creditNote,
       journal_entry_id: journalEntryId,
+      ...(warnings.length > 0 ? { warnings } : {}),
     })
   },
   { requireWrite: true },

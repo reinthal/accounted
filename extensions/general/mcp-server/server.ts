@@ -7,6 +7,7 @@ import {
   TOOL_SCOPE_MAP,
 } from '@/lib/auth/api-keys'
 import { createLogger } from '@/lib/logger'
+import { roundOre, sumOre } from '@/lib/money'
 import type { SupabaseClient } from '@supabase/supabase-js'
 import { buildMappingResultFromCategory } from '@/lib/bookkeeping/category-mapping'
 import { createTransactionJournalEntry } from '@/lib/bookkeeping/transaction-entries'
@@ -2060,7 +2061,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_get_agent_briefing',
     title: 'Get Agent Briefing',
-    description: 'Bootstrap this company\'s specialized accountant context in one call: profile_summary, the atoms loaded for the company (metadata only — call gnubok_load_skill for bodies), and the top-30 active memories. Call once at session start.',
+    description: 'Bootstrap this company\'s accountant context in one call: profile_summary, loaded atoms (metadata only — gnubok_load_skill for bodies), top-30 active memories. Call once at session start.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -4291,7 +4292,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_query_journal',
     title: 'Query Journal Lines',
-    description: "Flexible journal-line query — replaces chained ledger calls for ad-hoc questions. Filters: accounts, date range, amount range, voucher series/number, source type, status, project, cost center, free-text. Returns lines with parent voucher metadata + totals.",
+    description: "Flexible journal-line query for ad-hoc questions. Filters: account, date, amount, voucher series/number, source type, status, project, cost center, free-text. Returns lines with voucher metadata + totals.",
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -4666,7 +4667,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_match_transaction_to_invoice',
     title: 'Match Transaction to Invoice',
-    description: 'Match a bank transaction (income, amount>0) to a customer invoice. Confirm tx date/amount and invoice number/customer match before staging — preview mirrors what you pass. Supports partial payments and auto-storno of prior categorization.',
+    description: 'Match a bank transaction (income, amount>0) to a customer invoice. Confirm tx date/amount and invoice number/customer before staging. Supports partial payments and auto-storno of prior categorization.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -5273,7 +5274,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_find_voucher_candidates_for_invoice',
     title: 'Find Voucher Candidates (Invoice)',
-    description: "List posted verifikat that could be this invoice's payment (faktureringsmetoden: credit 1510; kontantmetoden: debit a bank/cash account 19xx). Call before gnubok_link_invoice_to_voucher to mark a faktura paid against an existing verifikation (no new bokföring).",
+    description: "List posted verifikat that could be this invoice's payment (faktureringsmetoden: credit 1510; kontantmetoden: debit 19xx). Call before gnubok_link_invoice_to_voucher to mark the faktura paid (no new bokföring).",
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -5339,7 +5340,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_link_invoice_to_voucher',
     title: 'Link Invoice to Voucher',
-    description: 'Markera en faktura som betald genom att länka till en befintlig bokförd verifikation (faktureringsmetoden: krediterar 1510; kontantmetoden: debiterar likvidkonto 19xx). Ingen ny verifikation skapas. Hitta kandidater med gnubok_find_voucher_candidates_for_invoice först.',
+    description: 'Markera en faktura som betald via länk till en befintlig verifikation (faktureringsmetoden: krediterar 1510; kontantmetoden: debiterar 19xx). Skapar ingen ny verifikation. Kör gnubok_find_voucher_candidates_for_invoice först.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -5426,7 +5427,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_find_voucher_candidates_for_supplier_invoice',
     title: 'Find Voucher Candidates (Supplier Invoice)',
-    description: 'List posted verifikat that debit leverantörsskuld (2440) and could be the payment for this supplier invoice. Use before gnubok_link_supplier_invoice_to_voucher when marking a leverantörsfaktura paid against an existing verifikation (no new bokföring).',
+    description: 'List posted verifikat that debit leverantörsskuld (2440) and could be this supplier invoice\'s payment. Call before gnubok_link_supplier_invoice_to_voucher to mark the leverantörsfaktura paid (no new bokföring).',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -5492,7 +5493,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_link_supplier_invoice_to_voucher',
     title: 'Link Supplier Invoice to Voucher',
-    description: 'Markera en leverantörsfaktura som betald genom att länka till en befintlig verifikation som redan debiterar leverantörsskuld (2440). Ingen ny verifikation skapas. Hitta kandidater med gnubok_find_voucher_candidates_for_supplier_invoice först.',
+    description: 'Markera en leverantörsfaktura som betald via länk till en befintlig verifikation som debiterar leverantörsskuld (2440). Skapar ingen ny verifikation. Kör gnubok_find_voucher_candidates_for_supplier_invoice först.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -5955,7 +5956,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_list_inbox_items',
     title: 'List Inbox Items',
-    description: 'List document inbox items. Each has a `processed` flag covering all terminal links (transaction match, supplier invoice, or journal entry), so a booked receipt counts as done. unprocessed_only=true returns only docs still needing handling.',
+    description: 'List document inbox items. `processed` covers all terminal links (transaction, supplier invoice, journal entry); booked receipts count as done. unprocessed_only=true returns docs still needing handling.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -6090,7 +6091,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_create_supplier_invoice_from_inbox',
     title: 'Create Supplier Invoice from Inbox',
-    description: "Atomic: turn an OCR'd inbox item into a staged supplier invoice. Resolves supplier (matched or via org_number/name), assembles line items from extracted_data, applies VAT + FX, attaches the source document. Stages for human review; honors dry_run.",
+    description: "Atomic: turn an OCR'd inbox item into a staged supplier invoice. Resolves supplier, builds lines from extracted_data, applies VAT + FX, attaches the document. Stages for human review; honors dry_run.",
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -8279,7 +8280,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_undo_sie_import',
     title: 'Undo SIE Import',
-    description: 'Stage undo of a completed SIE import: hard-deletes its entries (transactions + opening balance), detaches docs, resets voucher_sequences, marks the row \'undone\' so the file can be re-imported. Use after a botched import. Period must be open. HIGH risk.',
+    description: 'Stage undo of a completed SIE import: hard-deletes its entries, detaches docs, resets voucher_sequences, marks the import \'undone\' for re-import. Use after a botched import. Period must be open. HIGH risk.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -8380,7 +8381,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_create_voucher',
     title: 'Create Manual Voucher (Verifikation)',
-    description: 'Stage a manual verifikation with arbitrary balanced lines. Use for capitalization (1010), period-end accruals, FX adjustments, rättelseposter outside categorize_transaction. Pass inbox_item_id to book a kvitto direct — links inbox + attaches doc. HIGH risk.',
+    description: 'Stage a manual verifikation with arbitrary balanced lines: capitalization (1010), accruals, FX adjustments, rättelser outside categorize_transaction. Pass inbox_item_id to book a kvitto direct (links + attaches doc). HIGH risk.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -8778,7 +8779,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_reverse_journal_entry',
     title: 'Reverse Journal Entry (Storno)',
-    description: 'Stage a storno: inverts debits/credits; original stays visible per BFL 5 kap. Use only when the affärshändelse should never have been booked (duplicate, ghost, test). If booked wrong, use gnubok_correct_entry; for refunds, gnubok_credit_invoice. HIGH risk.',
+    description: 'Stage a storno: inverts debits/credits; original stays visible per BFL 5 kap. Only when the affärshändelse should never have been booked (duplicate, ghost, test). Booked wrong → gnubok_correct_entry; refund → gnubok_credit_invoice. HIGH risk.',
     inputSchema: {
       type: 'object',
       additionalProperties: false,
@@ -8974,6 +8975,56 @@ export const tools: McpTool[] = [
       if (!fiscalPeriodId) throw new Error('fiscal_period_id is required')
       const { buildAccrualsProposal } = await import('@/lib/bokslut/accruals/accrual-detector')
       return buildAccrualsProposal(supabase, companyId, fiscalPeriodId)
+    },
+  },
+
+  {
+    name: 'gnubok_list_accrual_schedules',
+    title: 'List Periodiseringar',
+    description:
+      'Löpande periodiseringar (17xx/29xx): monthly installments, dissolved and remaining amounts.',
+    inputSchema: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['active', 'completed', 'cancelled', 'all'],
+          description: "Default 'active'.",
+        },
+      },
+    },
+    outputSchema: { type: 'object', additionalProperties: true },
+    annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    async execute(args, companyId, _userId, supabase, _actor) {
+      const status = (args.status as string) || 'active'
+      let query = supabase
+        .from('accrual_schedules')
+        .select('*, installments:accrual_schedule_installments(*)')
+        .eq('company_id', companyId)
+        .order('created_at', { ascending: false })
+      if (status !== 'all') query = query.eq('status', status)
+      const { data, error } = await query
+      if (error) throw new Error(error.message)
+
+      type InstallmentRow = { period_month: string; amount: number; status: string }
+      const schedules = ((data ?? []) as Array<Record<string, unknown>>).map((schedule) => {
+        const installments = ([...((schedule.installments as InstallmentRow[]) ?? [])]).sort(
+          (a, b) => a.period_month.localeCompare(b.period_month),
+        )
+        const dissolved = sumOre(
+          installments.filter((i) => i.status === 'posted').map((i) => Number(i.amount)),
+        )
+        const total = Number(schedule.total_amount)
+        return {
+          ...schedule,
+          installments,
+          dissolved_amount: dissolved,
+          remaining_amount:
+            schedule.status === 'cancelled' ? 0 : roundOre(total - dissolved),
+        }
+      })
+      return { schedules, count: schedules.length }
     },
   },
 
@@ -9213,7 +9264,7 @@ export const tools: McpTool[] = [
   {
     name: 'gnubok_approve_pending_operation',
     title: 'Approve Pending Operation',
-    description: "Commit a staged pending_operation when the user has explicitly authorised the operation_id. risk_level=high requires confirmed=true — surface the BFL 5 kap 5§ irreversibility to the user first. The /pending web UI offers an equivalent commit path.",
+    description: "Commit a staged pending_operation the user has explicitly authorised. risk_level=high requires confirmed=true — surface the BFL 5 kap 5§ irreversibility first. The /pending web UI offers an equivalent commit path.",
     inputSchema: {
       type: 'object',
       additionalProperties: false,

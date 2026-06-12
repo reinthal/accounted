@@ -597,6 +597,31 @@ const INVOICE: Record<string, StructuredErrorEntry> = {
     message_sv: 'ROT/RUT-avdraget kunde inte valideras. Kontrollera personnummer och fastighetsbeteckning.',
     message_en: 'ROT/RUT deduction failed validation. Check personnummer and housing designation.',
   },
+  INVOICE_CREATE_ACCRUAL_INVALID: {
+    httpStatus: 400,
+    message_sv: 'Periodisering kan inte användas här. Den kräver faktureringsmetoden och stöds inte för omvänd skattskyldighet, export eller proforma.',
+    message_en: 'Periodisering cannot be used here. It requires the accrual method and is not supported for reverse charge, export, or proforma documents.',
+  },
+  ACCRUAL_NOT_FOUND: {
+    httpStatus: 404,
+    message_sv: 'Periodiseringen kunde inte hittas.',
+    message_en: 'Accrual schedule not found.',
+  },
+  ACCRUAL_DISSOLVE_FAILED: {
+    httpStatus: 400,
+    message_sv: 'Periodiseringen kunde inte lösas upp.',
+    message_en: 'The accrual schedule could not be dissolved.',
+  },
+  ACCRUAL_NOT_ACTIVE: {
+    httpStatus: 400,
+    message_sv: 'Periodiseringen är inte aktiv.',
+    message_en: 'The accrual schedule is not active.',
+  },
+  ACCRUAL_NOTHING_TO_DISSOLVE: {
+    httpStatus: 400,
+    message_sv: 'Det finns inget kvar att lösa upp.',
+    message_en: 'There is nothing left to dissolve on this accrual schedule.',
+  },
   INVOICE_CREATE_ROT_RUT_PERSONNUMMER_INVALID: {
     httpStatus: 400,
     message_sv: 'Personnumret för ROT/RUT-avdraget är ogiltigt.',
@@ -1298,6 +1323,17 @@ const PROVIDER_MIGRATION: Record<string, StructuredErrorEntry> = {
     message_sv: 'Tokensubmissionen misslyckades.',
     message_en: 'Failed to submit provider token.',
   },
+  PROVIDER_TOKEN_INVALID: {
+    // 422 (not 401): the UPSTREAM provider rejected the pasted credentials.
+    // The caller's own session is fine — a 401 here can trip client-side auth
+    // interceptors into logging the user out. Clients must dispatch on the
+    // error code, never on the HTTP status.
+    httpStatus: 422,
+    message_sv:
+      'Leverantören avvisade uppgifterna. Kontrollera att konto-ID och applikationstoken stämmer och försök igen.',
+    message_en:
+      'The provider rejected the credentials. Check that the account ID and application token are correct and try again.',
+  },
   PROVIDER_PREVIEW_FAILED: {
     httpStatus: 500,
     message_sv: 'Förhandsgranskningen från leverantören misslyckades.',
@@ -1309,14 +1345,19 @@ const PROVIDER_MIGRATION: Record<string, StructuredErrorEntry> = {
     message_en: 'Failed to fetch SIE data from the provider.',
   },
   PROVIDER_SIE_NO_YEARS: {
+    // The supported window is rolling (current year and the two before it) —
+    // the route interpolates the actual range via the messageSv/messageEn
+    // overrides on errorResponseFromCode(); this entry is the static fallback.
     httpStatus: 404,
-    message_sv: 'Inga räkenskapsår 2024–2026 hittades hos leverantören.',
-    message_en: 'No fiscal years available for 2024–2026.',
+    message_sv: 'Inga räkenskapsår inom det stödda intervallet hittades hos leverantören.',
+    message_en: 'No fiscal years available within the supported range.',
   },
-  PROVIDER_SIE_ONLY_FORTNOX: {
+  PROVIDER_SIE_NOT_SUPPORTED: {
     httpStatus: 400,
-    message_sv: 'SIE-export stöds för närvarande endast för Fortnox.',
-    message_en: 'SIE export is currently only supported for Fortnox.',
+    message_sv:
+      'Den här leverantören stöder inte SIE-hämtning via API. Ladda upp en SIE-fil manuellt istället.',
+    message_en:
+      'This provider does not support fetching SIE via API. Upload a SIE file manually instead.',
   },
   PROVIDER_SIE_IMPORT_REQUIRED: {
     httpStatus: 409,
@@ -1537,6 +1578,20 @@ const SUPPLIER_INVOICE_WAVE4: Record<string, StructuredErrorEntry> = {
       'Det finns inget räkenskapsår som täcker fakturadatumet. Lägg upp räkenskapsåret först, eller ändra fakturadatumet.',
     message_en:
       'No fiscal year covers the invoice date. Create the fiscal year first, or change the invoice date.',
+  },
+  SI_CREATE_ACCRUAL_REVERSE_CHARGE: {
+    httpStatus: 400,
+    message_sv:
+      'Periodisering kan inte kombineras med omvänd skattskyldighet. Kostnadsraden utgör momsunderlaget i momsdeklarationen (ruta 20–32), så nettobeloppet kan inte skjutas upp till ett interimskonto.',
+    message_en:
+      'Periodisering cannot be combined with reverse charge. The expense line carries the VAT base for the VAT declaration (boxes 20–32), so the net amount cannot be deferred to an interim account.',
+  },
+  SI_DELETE_HAS_BOOKING: {
+    httpStatus: 400,
+    message_sv:
+      'Leverantörsfakturan är bokförd eller har en periodisering och kan inte tas bort. Skapa en kreditfaktura i stället för att återställa bokföringen.',
+    message_en:
+      'The supplier invoice has a posted journal entry or an accrual schedule and cannot be deleted. Create a credit note instead to reverse the bookkeeping.',
   },
   SI_PAID_ALREADY: {
     httpStatus: 409,
@@ -2280,6 +2335,56 @@ const SKATTEVERKET: Record<string, StructuredErrorEntry> = {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Bolagsverket filing codes (digital inlämning av årsredovisning)
+// ─────────────────────────────────────────────────────────────────
+
+const BOLAGSVERKET: Record<string, StructuredErrorEntry> = {
+  BOLAGSVERKET_API_ERROR: {
+    httpStatus: 502,
+    message_sv: 'Bolagsverkets tjänst svarade med ett fel. Se detaljerna och försök igen.',
+    message_en: 'The Bolagsverket API returned an error. See details for the upstream message.',
+  },
+  BOLAGSVERKET_SUBMISSION_EXISTS: {
+    httpStatus: 409,
+    message_sv:
+      'Det finns redan en aktiv inlämning av årsredovisningen för räkenskapsåret. Invänta Bolagsverkets besked innan du lämnar in på nytt.',
+    message_en:
+      'An active årsredovisning submission already exists for this fiscal period. Wait for Bolagsverket to resolve it before submitting again.',
+  },
+  BOLAGSVERKET_FORBIDDEN: {
+    httpStatus: 403,
+    message_sv: 'Otillräcklig behörighet för att lämna in årsredovisning för det här företaget.',
+    message_en:
+      'Insufficient role to file an årsredovisning for this company (viewer members cannot submit).',
+  },
+  BOLAGSVERKET_INVALID_ENVIRONMENT: {
+    httpStatus: 400,
+    message_sv: "Ogiltig Bolagsverket-miljö. Tillåtna värden: 'test', 'accept', 'prod'.",
+    message_en: "Invalid Bolagsverket environment. Allowed values: 'test', 'accept', 'prod'.",
+  },
+  BOLAGSVERKET_ENV_NOT_ALLOWED: {
+    httpStatus: 403,
+    message_sv:
+      'Den valda Bolagsverket-miljön är inte tillåten i den här installationen. Plattformens BOLAGSVERKET_ENV sätter taket.',
+    message_en:
+      'The selected Bolagsverket environment exceeds the platform ceiling set by BOLAGSVERKET_ENV (order: test < accept < prod; unset means test).',
+  },
+  BOLAGSVERKET_CONFIG_MISSING: {
+    httpStatus: 503,
+    message_sv:
+      'Serverkonfiguration saknas för Bolagsverket-integrationen. Kontakta administratören.',
+    message_en:
+      'Server configuration required by the Bolagsverket integration is missing (see details).',
+  },
+  BOLAGSVERKET_NO_SUBSCRIPTION: {
+    httpStatus: 404,
+    message_sv: 'Ingen händelseprenumeration finns för företaget ännu.',
+    message_en:
+      'No Bolagsverket event subscription exists for this company yet. One is created on the first submission.',
+  },
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Combined registry
 // ─────────────────────────────────────────────────────────────────
 
@@ -2320,6 +2425,7 @@ const REGISTRY: Record<string, StructuredErrorEntry> = {
   ...API_KEY,
   ...PROVIDER,
   ...SKATTEVERKET,
+  ...BOLAGSVERKET,
 }
 
 export function getErrorEntry(code: string): StructuredErrorEntry | undefined {
