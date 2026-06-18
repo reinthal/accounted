@@ -83,6 +83,8 @@ const LABELS = {
     bic: 'BIC/SWIFT:',
     ocr: 'OCR/Referens:',
     paymentReference: 'Betalningsreferens:',
+    invoiceNumber: 'Fakturanummer:',
+    swishQrCaption: 'Skanna för att betala med Swish',
     // Footer
     orgNoLong: 'Org.nr:',
     vatRegNo: 'Momsreg.nr:',
@@ -146,6 +148,8 @@ const LABELS = {
     bic: 'BIC/SWIFT:',
     ocr: 'Reference:',
     paymentReference: 'Payment reference:',
+    invoiceNumber: 'Invoice number:',
+    swishQrCaption: 'Scan to pay with Swish',
     orgNoLong: 'Reg. no.:',
     vatRegNo: 'VAT reg. no.:',
     // Statutory Swedish phrase — kept verbatim in both locales. Peppol SE-R-005
@@ -154,6 +158,11 @@ const LABELS = {
     fSkatt: 'Godkänd för F-skatt',
   },
 } as const
+
+// Swish on invoices (the number row + the payment QR) is "coming soon" — gated
+// off until the QR flow is finished. Flip to true to re-enable both at once;
+// the settings "Visa Swish" toggle is disabled while this is false.
+export const SHOW_SWISH_ON_INVOICE = false
 
 // Labor-only disclaimer for the ROT/RUT block. Kept Swedish-only in both
 // locales — references Skatteverket's fakturamodell directly, which is a
@@ -622,9 +631,12 @@ interface InvoicePDFProps {
    * suite and for callers that haven't yet been migrated to forward branding.
    */
   branding?: InvoiceBranding
+  /** Pre-rendered Swish payment QR (PNG data URL). Built offline in
+   *  pdf-render-helpers; null/omitted renders no QR. */
+  swishQrDataUrl?: string | null
 }
 
-export function InvoicePDF({ invoice, customer, items, company, originalInvoiceNumber, isPreview, language, branding }: InvoicePDFProps) {
+export function InvoicePDF({ invoice, customer, items, company, originalInvoiceNumber, isPreview, language, branding, swishQrDataUrl }: InvoicePDFProps) {
   const lang: PdfLang = language ?? customer.language ?? 'sv'
   const L = LABELS[lang]
   // Build the stylesheet per-render so each invoice picks up its company's
@@ -1039,7 +1051,7 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
                 <Text style={styles.paymentValue}>{company.plusgiro}</Text>
               </View>
             )}
-            {company.swish && (company.invoice_show_swish ?? false) && (
+            {SHOW_SWISH_ON_INVOICE && company.swish && (company.invoice_show_swish ?? false) && (
               <View style={styles.paymentRow}>
                 <Text style={styles.paymentLabel}>{L.swish}</Text>
                 <Text style={styles.paymentValue}>{company.swish}</Text>
@@ -1061,16 +1073,22 @@ export function InvoicePDF({ invoice, customer, items, company, originalInvoiceN
               <Text style={styles.paymentLabel}>{L.dueDate}</Text>
               <Text style={[styles.paymentValue, { fontWeight: 'bold' }]}>{formatDate(invoice.due_date)}</Text>
             </View>
+            {invoice.invoice_number && (
+              <View style={styles.paymentRow}>
+                <Text style={styles.paymentLabel}>{L.invoiceNumber}</Text>
+                <Text style={[styles.paymentValue, { fontWeight: 'bold' }]}>{invoice.invoice_number}</Text>
+              </View>
+            )}
             {(company.invoice_show_ocr ?? true) && (company.bankgiro || company.plusgiro) && lang === 'sv' && (
               <View style={styles.paymentRow}>
                 <Text style={styles.paymentLabel}>{L.ocr}</Text>
                 <Text style={[styles.paymentValue, { fontWeight: 'bold' }]}>{invoice.invoice_number ? generateOcrReference(invoice.invoice_number) : '—'}</Text>
               </View>
             )}
-            {lang !== 'sv' && invoice.invoice_number && (
-              <View style={styles.paymentRow}>
-                <Text style={styles.paymentLabel}>{L.paymentReference}</Text>
-                <Text style={[styles.paymentValue, { fontWeight: 'bold' }]}>{invoice.invoice_number}</Text>
+            {swishQrDataUrl && (
+              <View style={{ marginTop: 10, alignItems: 'center' }}>
+                <Image src={swishQrDataUrl} style={{ width: 96, height: 96 }} />
+                <Text style={[styles.paymentLabel, { marginTop: 2 }]}>{L.swishQrCaption}</Text>
               </View>
             )}
           </View>
