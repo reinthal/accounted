@@ -43,6 +43,8 @@ import {
 } from '@/lib/bookkeeping/supplier-invoice-entries'
 import { linkInvoiceToVoucher } from '@/lib/invoices/voucher-matching'
 import { planInvoicePayment } from '@/lib/invoices/apply-invoice-payment'
+import { detectBookingDuplicate } from '@/lib/transactions/booking-duplicate-detection'
+import { findDuplicatePaymentCandidatesForInvoice } from '@/lib/invoices/duplicate-payment-candidates'
 import { linkSupplierInvoiceToVoucher } from '@/lib/invoices/supplier-voucher-matching'
 import { linkTransactionToJournalEntry } from '@/lib/transactions/link-journal-entry'
 import { getErrorEntry } from '@/lib/errors/structured-errors'
@@ -69,6 +71,7 @@ import { prepareInvoicePdfRender, buildSwishQrDataUrl } from '@/lib/invoices/pdf
 import { ensureInvoiceNumber } from '@/lib/invoices/ensure-invoice-number'
 import { createLogger } from '@/lib/logger'
 import { appendProcessingHistory } from '@/lib/processing-history/append'
+import { roundOre } from '@/lib/money'
 import { CreateSupplierParamsSchema } from '@/lib/pending-operations/schemas/create-supplier'
 import { CreateArticleParamsSchema, UpdateArticleParamsSchema } from '@/lib/pending-operations/schemas/article'
 import { ensureArticleNumber } from '@/lib/articles/ensure-article-number'
@@ -272,6 +275,78 @@ async function commitCategorizeTransaction(
   }
   if (transaction.journal_entry_id) {
     return { error: 'Transaction already has a journal entry — it was categorized in the meantime.', status: 409 }
+  }
+
+  // Booking-time duplicate guard — parity with the web /categorize route, which
+  // the agent path otherwise bypassed entirely. Refuse to mint a second
+  // verifikat for an affärshändelse already in the ledger: an already-booked
+  // sibling transaction, OR an unlinked voucher that already books this amount
+  // on the bank account (invoice "markera som betald", the salary run's net-wage
+  // payout, a manual verifikat). The agent has no interactive "Bokför ändå", so
+  // it fails closed; re-stage with allow_duplicate=true after the user confirms
+  // in chat that the bank line is a genuinely separate event. Fail-open on a
+  // detection error so a transient query failure never blocks a real booking.
+  if (params.allow_duplicate !== true) {
+    let dup = null
+    try {
+      dup = await detectBookingDuplicate(supabase, companyId, {
+        id: txId,
+        date: transaction.date,
+        amount: transaction.amount,
+        cash_account_id: transaction.cash_account_id ?? null,
+      })
+    } catch (err) {
+      log.warn('booking-time duplicate detection failed (continuing)', err)
+    }
+    if (dup) {
+      const amountAbs = roundOre(Math.abs(Number(transaction.amount)))
+      const voucher = dup.voucher_label ? `verifikat ${dup.voucher_label}` : 'en befintlig verifikation'
+      return {
+        error:
+          `Möjlig dubblettbokföring: ${voucher} (${dup.entry_date}) bokför redan ${amountAbs} kr på bankkontot. ` +
+          `Den här affärshändelsen ser redan ut att vara bokförd — länka transaktionen till den befintliga ` +
+          `verifikationen i stället för att bokföra den igen. Om banktransaktionen verkligen är en separat ` +
+          `affärshändelse, kör om med allow_duplicate=true.`,
+        status: 409,
+      }
+    }
+  } else {
+    // allow_duplicate=true bypassed the guard. Booking over a possible
+    // double-booking is a bookkeeping act that must leave a durable
+    // behandlingshistorik record (BFNAR 2013:2 kap 8) — the web /book and
+    // /categorize routes log BankTransactionDuplicateDismissed, and the agent
+    // commit path must reach parity so an auditor can reconstruct why the
+    // duplicate was allowed. Re-detect to capture the dismissed candidate;
+    // best-effort, a logging failure must never block a legitimate booking.
+    try {
+      const dismissed = await detectBookingDuplicate(supabase, companyId, {
+        id: txId,
+        date: transaction.date,
+        amount: transaction.amount,
+        cash_account_id: transaction.cash_account_id ?? null,
+      })
+      if (dismissed) {
+        await appendProcessingHistory({
+          companyId,
+          correlationId: txId,
+          aggregateType: 'BankTransaction',
+          aggregateId: txId,
+          eventType: 'BankTransactionDuplicateDismissed',
+          payload: {
+            transaction_id: txId,
+            dismissed_transaction_id: dismissed.transaction_id,
+            dismissed_journal_entry_id: dismissed.journal_entry_id,
+            amount_ore: Math.round(dismissed.amount * 100),
+            entry_date: dismissed.entry_date,
+            via: 'allow_duplicate',
+          },
+          actor: { type: 'user', id: userId },
+          occurredAt: new Date(),
+        })
+      }
+    } catch (logErr) {
+      log.warn('failed to record duplicate-dismissal behandlingshistorik', logErr)
+    }
   }
 
   const isBusiness = category !== 'private'
@@ -849,6 +924,82 @@ async function commitMarkInvoicePaid(
   if (invoiceError || !invoice) return { error: 'Invoice not found', status: 404 }
   if (invoice.status !== 'sent' && invoice.status !== 'overdue') {
     return { error: 'Invoice can only be marked as paid when status is "sent" or "overdue"', status: 409 }
+  }
+
+  // Duplicate-payment guard — parity with the web mark-paid route, which the
+  // agent path otherwise bypassed. If an unlinked inbound bank transaction
+  // already looks like this invoice's payment, booking a parallel payment
+  // voucher here creates exactly the orphan that later double-counts the
+  // receipt. Fail closed; the agent re-stages with allow_duplicate=true (after
+  // the user confirms) or, better, matches the transaction to the invoice
+  // instead. Fail-open on a detection error so it never blocks a real payment.
+  if (params.allow_duplicate !== true) {
+    const customerName = (invoice as { customer?: { name?: string } }).customer?.name
+    if (customerName) {
+      const remainingAmount =
+        (invoice as { remaining_amount?: number }).remaining_amount ?? invoice.total
+      let candidates: Awaited<ReturnType<typeof findDuplicatePaymentCandidatesForInvoice>> = []
+      try {
+        candidates = await findDuplicatePaymentCandidatesForInvoice(supabase, {
+          companyId,
+          invoice: { invoice_number: invoice.invoice_number, customer_name: customerName },
+          paymentAmount: remainingAmount,
+          paymentDate,
+        })
+      } catch (err) {
+        log.warn('duplicate-payment detection failed (continuing)', err)
+      }
+      if (candidates.length > 0) {
+        return {
+          error:
+            `Möjlig dubbelbetalning: en obokförd banktransaktion ser ut att vara betalningen för faktura ` +
+            `${invoice.invoice_number}. Matcha banktransaktionen mot fakturan (gnubok_match_transaction_to_invoice) ` +
+            `i stället för att bokföra en separat betalning. Om det verkligen rör sig om en annan betalning, ` +
+            `kör om med allow_duplicate=true.`,
+          status: 409,
+        }
+      }
+    }
+  } else {
+    // allow_duplicate=true bypassed the duplicate-payment guard. The decision
+    // to book a payment over a possible existing one must leave a durable
+    // behandlingshistorik record (BFNAR 2013:2 kap 8) so an auditor can see why
+    // the duplicate was allowed. Re-detect to capture the dismissed candidate;
+    // best-effort, never blocks the payment. Payload stays PII-safe
+    // (ids/amounts/dates only — no customer or merchant name).
+    const customerName = (invoice as { customer?: { name?: string } }).customer?.name
+    if (customerName) {
+      try {
+        const remainingAmount =
+          (invoice as { remaining_amount?: number }).remaining_amount ?? invoice.total
+        const dismissed = await findDuplicatePaymentCandidatesForInvoice(supabase, {
+          companyId,
+          invoice: { invoice_number: invoice.invoice_number, customer_name: customerName },
+          paymentAmount: remainingAmount,
+          paymentDate,
+        })
+        if (dismissed.length > 0) {
+          await appendProcessingHistory({
+            companyId,
+            correlationId: invoiceId,
+            aggregateType: 'System',
+            aggregateId: invoiceId,
+            eventType: 'InvoiceDuplicatePaymentDismissed',
+            payload: {
+              invoice_id: invoiceId,
+              payment_date: paymentDate,
+              dismissed_transaction_ids: dismissed.map((c) => c.id),
+              candidate_count: dismissed.length,
+              via: 'allow_duplicate',
+            },
+            actor: { type: 'user', id: userId },
+            occurredAt: new Date(),
+          })
+        }
+      } catch (logErr) {
+        log.warn('failed to record duplicate-payment-dismissal behandlingshistorik', logErr)
+      }
+    }
   }
 
   const { data: settings } = await supabase
