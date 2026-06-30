@@ -75,7 +75,7 @@ export type InvoiceEditorProps =
 // Subset of Article fields the line picker needs to pre-fill a row.
 type ArticleOption = Pick<
   Article,
-  'id' | 'article_number' | 'name' | 'unit' | 'price_excl_vat' | 'vat_rate' | 'revenue_account'
+  'id' | 'article_number' | 'name' | 'unit' | 'price_excl_vat' | 'vat_rate' | 'revenue_account' | 'currency'
 >
 
 function RequiredMark() {
@@ -361,7 +361,7 @@ export default function InvoiceEditor(props: InvoiceEditorProps = { mode: 'creat
     if (!company?.id) return
     const { data } = await supabase
       .from('articles')
-      .select('id, article_number, name, unit, price_excl_vat, vat_rate, revenue_account')
+      .select('id, article_number, name, unit, price_excl_vat, vat_rate, revenue_account, currency')
       .eq('company_id', company.id)
       .eq('active', true)
       .order('name')
@@ -403,6 +403,11 @@ export default function InvoiceEditor(props: InvoiceEditorProps = { mode: 'creat
     // The account override rides along regardless of rate; the engine ignores it
     // for reverse-charge/export and validates it against the chart of accounts.
     setValue(`items.${index}.revenue_account`, a.revenue_account ?? null, { shouldDirty: true })
+    // Pre-fill the invoice's (single) currency from the article when it differs.
+    // The article's currency comes from the currencies reference table.
+    if (a.currency && currencies.includes(a.currency as Currency)) {
+      setValue('currency', a.currency as Currency, { shouldDirty: true })
+    }
   }
 
   // "Spara som artikel": persist the current free-text line into the register and
